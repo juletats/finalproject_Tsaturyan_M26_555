@@ -1,29 +1,34 @@
-"""Вспомогательные функции: пути к данным, валидаторы, хеширование, курсы.
+"""Вспомогательные функции: валидаторы, хеширование, курсы, форматирование.
+
+Пути к хранилищу и параметры свежести курсов берутся из Singleton
+SettingsLoader, а ввод-вывод JSON - из Singleton DatabaseManager: файл
+открыть и записать можно только через слой infra, бизнес-логика работает со
+словарями.
 """
 
 import hashlib
-import json
-import os
 import re
 import secrets
 from datetime import datetime
 
-# --- Пути к хранилищу -------------------------------------------------------
-ENV_DATA_DIR = "VALUTATRADE_HOME"
-DATA_DIR = os.environ.get(ENV_DATA_DIR) or os.path.join(os.getcwd(), "data")
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
-PORTFOLIOS_FILE = os.path.join(DATA_DIR, "portfolios.json")
-RATES_FILE = os.path.join(DATA_DIR, "rates.json")
+from valutatrade_hub.infra.database import DatabaseManager
+from valutatrade_hub.infra.settings import SettingsLoader
+
+SETTINGS = SettingsLoader()
+DATABASE = DatabaseManager()
 
 # --- Правила данных ---------------------------------------------------------
-BASE_CURRENCY = "USD"
-MIN_PASSWORD_LENGTH = 4
+BASE_CURRENCY = SETTINGS.get("base_currency", "USD")
+MIN_PASSWORD_LENGTH = int(SETTINGS.get("min_password_length", 4))
 SALT_LENGTH = 8
 # Код валюты: 2-5 символов, только цифры и заглавные латинские буквы
 CURRENCY_PATTERN = re.compile(r"^[A-Z0-9]{2,5}$")
-# Балансы крипто-валют показываются с четырьмя знаками, фиатные - с двумя
+# Балансы крипто-валют показываются с четырьмя знаками, фиатные - с двумя.
+# Типы валют как объекты описаны в core/currencies.py, здесь только правило
+# вывода чисел
 CRYPTO_CURRENCIES = frozenset({"BTC", "ETH"})
-# Сколько секунд запись в rates.json считается актуальной
+# Сколько секунд запись в rates.json считается актуальной (значение по
+# умолчанию; реально TTL читается из конфигурации в момент проверки)
 RATES_TTL_SECONDS = 5 * 60
 # Источник курсов, пока Parser Service не подключён
 STUB_SOURCE = "RateServiceStub"
@@ -37,30 +42,29 @@ DEFAULT_EXCHANGE_RATES = {
 }
 
 
-# --- Работа с JSON ----------------------------------------------------------
+# --- Хранилище и конфигурация ------------------------------------------------
 
 
-def load_json(filepath, default):
-    """ Читает JSON-файл.
+def data_dir():
+    """ Каталог с JSON-файлами из конфигурации."""
+    return SETTINGS.get("data_dir")
 
-    Возвращает default, если файла ещё нет, он пуст или содержит повреждённые
-    данные - приложение не должно падать из-за хранилища.
+
+def storage_path(collection):
+    """ Путь файла коллекции ('users', 'portfolios', 'rates')."""
+    return DATABASE.path(collection)
+
+
+def rates_ttl():
+    """ TTL курсов в секундах.
+
+    Значение читается каждый раз при обращении, поэтому SettingsLoader.reload()
+    меняет политику свежести без перезапуска приложения.
     """
     try:
-        with open(filepath, "r", encoding="utf-8") as file:
-            data = json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return default
-    if data is None:
-        return default
-    return data
-
-
-def save_json(filepath, data):
-    """ Сохраняет данные в JSON-файл, создавая каталог при необходимости."""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
+        return float(SETTINGS.get("rates_ttl_seconds", RATES_TTL_SECONDS))
+    except (TypeError, ValueError):
+        return float(RATES_TTL_SECONDS)
 
 
 def next_identifier(records, key):
@@ -217,12 +221,14 @@ def find_rate(rates, currency_from, currency_to):
     return from_rate / to_rate, min(stamps) if stamps else None
 
 
-def is_fresh(updated_at, now=None, ttl_seconds=RATES_TTL_SECONDS):
+def is_fresh(updated_at, now=None, ttl_seconds=None):
+    """ True, если метка времени обновления не старше TTL из конфигурации."""
     moment = parse_datetime(updated_at)
     if moment is None:
         return False
     reference = now or datetime.now()
-    return (reference - moment).total_seconds() <= ttl_seconds
+    lifetime = rates_ttl() if ttl_seconds is None else float(ttl_seconds)
+    return (reference - moment).total_seconds() <= lifetime
 
 
 def build_stub_rates(now=None):
@@ -261,13 +267,13 @@ def refresh_rates(rates, now=None):
 
 def load_rates():
     """ Читает кеш курсов из rates.json (пустой словарь, если файла нет)."""
-    rates = load_json(RATES_FILE, default={})
+    rates = DATABASE.read("rates", default={})
     return rates if isinstance(rates, dict) else {}
 
 
 def save_rates(rates):
-    """ Сохраняет кеш курсов в rates.json."""
-    save_json(RATES_FILE, rates)
+    """ Сохраняет кеш курсов в rates.json атомарной записью."""
+    DATABASE.write("rates", rates)
 
 
 def rates_or_stub(rates=None):
@@ -283,9 +289,11 @@ def rates_or_stub(rates=None):
     return build_stub_rates()
 
 
-def create_rate_cache(ttl_seconds=RATES_TTL_SECONDS):
+def create_rate_cache(ttl_seconds=None):
     """ Создаёт кэш курсов
-        Возвращает cached_rate(key, loader): значение помнится ttl_seconds секунд,
+        Возвращает cached_rate(key, loader): значение помнится TTL секунд -
+        либо из аргумента, либо из конфигурации (проверяется при каждом
+        обращении),
         по истечении - вычисляется loader(key) заново. У cached_rate есть метод
         clear() для сброса после обновления курса.
     """
@@ -294,10 +302,11 @@ def create_rate_cache(ttl_seconds=RATES_TTL_SECONDS):
     def cached_rate(key, loader):
         """ Возвращает свежее значение из кэша либо вычисляет его."""
         now = datetime.now()
+        lifetime = rates_ttl() if ttl_seconds is None else float(ttl_seconds)
         entry = cache.get(key)
         if entry is not None:
             stored_at, value = entry
-            if (now - stored_at).total_seconds() <= ttl_seconds:
+            if (now - stored_at).total_seconds() <= lifetime:
                 return value
         value = loader(key)
         cache[key] = (now, value)

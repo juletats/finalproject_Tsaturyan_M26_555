@@ -1,4 +1,4 @@
-.PHONY: install lint format run once build clean
+.PHONY: install lint format run once logs build clean
 
 ## Установка зависимостей и создание окружения
 install:
@@ -16,9 +16,17 @@ format:
 run:
 	uv run valutatrade
 
-## Запуск одной команды: make once CMD="register --username alice --password 1234"
+## Запуск одной команды: make once CMD="register --username me --password 1234"
 once:
 	uv run valutatrade $(CMD)
+
+## Последние строки журнала операций: make logs LOG_LINES=50
+logs:
+	@if [ -f logs/actions.log ]; then \
+		tail -n $(or $(LOG_LINES),20) logs/actions.log; \
+	else \
+		echo "Журнал ещё не создан: logs/actions.log - выполните пару команд приложения"; \
+	fi
 
 ## Сборка пакета
 build:

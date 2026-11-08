@@ -1,20 +1,27 @@
 """Бизнес-логика платформы: регистрация, вход, сделки с портфелем и курсы.
+
+Модуль - единственный владелец состояния: сессии, кеша курсов и обращений к
+хранилищу (Singleton DatabaseManager). Сюда подключаются иерархия валют
+(core/currencies.py), доменные исключения (core/exceptions.py) и логирование
+операций декоратором @log_action (decorators.py). Печати и разбора строки ввода
+здесь нет - это слой cli/interface.py.
 """
 
 from datetime import datetime
 
-from valutatrade_hub.core import utils
-from valutatrade_hub.core.models import (
+from valutatrade_hub import decorators
+from valutatrade_hub.core import currencies, utils
+from valutatrade_hub.core.exceptions import (
+    ApiRequestError,
     DuplicateUsernameError,
     NoSessionError,
-    Portfolio,
     RateLookupError,
-    RateServiceError,
     UnknownCurrencyError,
-    User,
     UserNotFoundError,
     WrongPasswordError,
 )
+from valutatrade_hub.core.models import Portfolio, User
+from valutatrade_hub.infra.database import DatabaseManager
 
 # Сделки считаются «оценочно»: по умолчанию покупка не списывает и продажа не
 # начисляет USD. Чтобы включить расчёты через USD-кошелёк, поставьте True.
@@ -25,6 +32,15 @@ rate_cache = utils.create_rate_cache()
 
 session = {"user": None}
 
+# Хранилище и конфигурация - синглтоны инфраструктурного слоя
+DATABASE = DatabaseManager()
+
+# Декоратору нужно имя пользователя для строк лога; резолвер передаётся сюда,
+# чтобы decorators не импортировал usecases (обратный импорт = цикл)
+decorators.set_username_resolver(lambda: logged_in_username())
+
+
+# --- Сессия ------------------------------------------------------------------
 
 def current_user():
     """ Возвращает пользователя текущей сессии """
@@ -35,6 +51,7 @@ def current_user():
 
 
 def logged_in_username():
+    """ Имя пользователя текущей сессии либо None."""
     user = session["user"]
     return user.username if user else None
 
@@ -44,9 +61,11 @@ def logout():
     session["user"] = None
 
 
+# --- Хранилище через DatabaseManager ----------------------------------------
+
 def load_users():
-    """ Читает список пользователей из users.json."""
-    records = utils.load_json(utils.USERS_FILE, default=[])
+    """ Читает список пользователей из коллекции users."""
+    records = DATABASE.read("users", default=[])
     if not isinstance(records, list):
         return []
     return [
@@ -57,10 +76,12 @@ def load_users():
 
 
 def save_users(users):
-    utils.save_json(utils.USERS_FILE, [user.to_dict() for user in users])
+    """ Перезаписывает коллекцию users целиком."""
+    DATABASE.write("users", [user.to_dict() for user in users])
 
 
 def find_user(username):
+    """ Возвращает пользователя по имени (регистр не значим)."""
     for user in load_users():
         if user.username.lower() == username.lower():
             return user
@@ -68,7 +89,8 @@ def find_user(username):
 
 
 def load_portfolio(user_id, user=None):
-    records = utils.load_json(utils.PORTFOLIOS_FILE, default=[])
+    """ Читает портфель пользователя; пустого - если записи ещё нет."""
+    records = DATABASE.read("portfolios", default=[])
     if isinstance(records, list):
         for record in records:
             if isinstance(record, dict) and record.get("user_id") == user_id:
@@ -77,37 +99,52 @@ def load_portfolio(user_id, user=None):
 
 
 def save_portfolio(portfolio):
-    records = utils.load_json(utils.PORTFOLIOS_FILE, default=[])
-    if not isinstance(records, list):
-        records = []
+    """ Сохраняет портфель безопасной операцией чтение->изменение->запись."""
     payload = portfolio.to_dict()
-    replaced = False
-    for index, record in enumerate(records):
-        if isinstance(record, dict) and record.get("user_id") == (
-                portfolio.user_id
-        ):
-            records[index] = payload
-            replaced = True
-            break
-    if not replaced:
-        records.append(payload)
-    utils.save_json(utils.PORTFOLIOS_FILE, records)
 
+    def _replace_or_append(records):
+        """ Ставит запись портфеля на место существующей или добавляет её."""
+        items = records if isinstance(records, list) else []
+        for index, record in enumerate(items):
+            same_owner = (
+                isinstance(record, dict)
+                and record.get("user_id") == payload["user_id"]
+            )
+            if same_owner:
+                items[index] = payload
+                return items
+        items.append(payload)
+        return items
+
+    return DATABASE.update("portfolios", _replace_or_append)
+
+
+# --- Курсы -------------------------------------------------------------------
 
 def refresh_rates(rates, now=None):
     """ Обновляет таблицу курсов и сохраняет её в rates.json.
+
     Пока Parser Service не подключён, курсы берутся из заглушки
-    utils.build_stub_rates. Для подключения сервиса достаточно заменить тело
-    функции на обращение к сервису: контракт (формат rates.json) не изменится.
+    utils.build_stub_rates. Тело функции - точка подключения сервиса: запрос к
+    API оборачивается в ApiRequestError, если курс не получен, а формат кеша
+    (rates.json) не меняется.
     """
-    updated = utils.refresh_rates(rates, now)
+    try:
+        updated = utils.refresh_rates(rates, now)
+    except (TypeError, ValueError, OSError) as error:
+        raise ApiRequestError(str(error)) from error
+    if not any(isinstance(value, dict) for value in updated.values()):
+        raise ApiRequestError("источник курсов вернул пустую таблицу")
     utils.save_rates(updated)
     rate_cache.clear()
     return updated
 
 
 def fresh_rates():
-    """ Возвращает таблицу курсов, обновляя кеш, если он устарел."""
+    """ Возвращает таблицу курсов, обновляя кеш, если он устарел.
+
+    Политика свежести (rates_ttl_seconds) берётся из конфигурации приложения.
+    """
     rates = utils.load_rates()
     if not utils.is_fresh(rates.get("last_refresh")):
         rates = refresh_rates(rates)
@@ -124,7 +161,9 @@ def lookup_rate(currency_from, currency_to):
         rates = refresh_rates(rates)
         found = utils.find_rate(rates, currency_from, currency_to)
     if found is None:
-        raise RateServiceError(currency_from, currency_to)
+        raise ApiRequestError(
+            f"нет данных для пары {currency_from}→{currency_to}"
+        )
     rate, updated_at = found
     return {
         "rate": rate,
@@ -132,13 +171,18 @@ def lookup_rate(currency_from, currency_to):
     }
 
 
+@decorators.log_action("GET_RATE")
 def get_rate(currency_from, currency_to):
     """ Возвращает курс одной валюты к другой и обратный курс.
-        Результат кэшируется на время сессии, поэтому повторный запрос той же пары
-        не читает и не обновляет файл.
+
+        Коды проверяются сначала на формат, затем на присутствие в реестре
+        валют (CurrencyNotFoundError). Результат кэшируется на время сессии,
+        поэтому повторный запрос той же пары не читает и не обновляет файл.
     """
     from_code = utils.validate_currency_code(currency_from)
     to_code = utils.validate_currency_code(currency_to)
+    currencies.get_currency(from_code)
+    currencies.get_currency(to_code)
     entry = rate_cache((from_code, to_code), lambda key: lookup_rate(*key))
     return {
         "currency_from": from_code,
@@ -159,6 +203,7 @@ def price_to_base(currency_code, rates, base_currency):
 
 # --- Команды пользователя ----------------------------------------------------
 
+@decorators.log_action("REGISTER")
 def register_user(username, password):
     """ Создаёт пользователя и пустой портфель.
 
@@ -175,12 +220,19 @@ def register_user(username, password):
         [user.to_dict() for user in users], "user_id"
     )
     user = User.create(username=name, password=password, user_id=user_id)
-    users.append(user)
-    save_users(users)
+
+    def _append(records):
+        """ Добавляет запись пользователя в конец коллекции."""
+        items = records if isinstance(records, list) else []
+        items.append(user.to_dict())
+        return items
+
+    DATABASE.update("users", _append)
     save_portfolio(Portfolio(_user_id=user_id, user=user))
     return {"user_id": user.user_id, "username": user.username}
 
 
+@decorators.log_action("LOGIN")
 def login_user(username, password):
     """ Проверяет пароль и фиксирует сессию пользователя."""
     name = utils.validate_username(username)
@@ -223,13 +275,16 @@ def get_portfolio_summary(base_currency=None):
     }
 
 
+@decorators.log_action("BUY", verbose=True)
 def buy_currency(currency_code, amount):
     """ Покупает валюту: создаёт кошелёк при необходимости и пополняет баланс.
 
-    Возвращает данные для отчёта: курс, изменения балансов, оценочную стоимость.
+    Код валюты проходит проверку формата и проверку присутствия в реестре
+    валют, сумма - проверку положительности. Возвращает данные для отчёта:
+    курс, изменения балансов, оценочную стоимость.
     """
     user = current_user()
-    code = utils.validate_currency_code(currency_code)
+    code = validate_tradable_code(currency_code)
     value = utils.validate_amount(amount)
 
     portfolio = load_portfolio(user.user_id, user=user)
@@ -247,24 +302,18 @@ def buy_currency(currency_code, amount):
         changes.append(apply(usd, lambda: usd.withdraw(cost)))
 
     save_portfolio(portfolio)
-    return {
-        "operation": "buy",
-        "currency_code": code,
-        "amount": value,
-        "rate": price,
-        "base": utils.BASE_CURRENCY,
-        "changes": changes,
-        "estimate": value * price,
-    }
+    return trade_result("buy", user.username, code, value, price, changes)
 
 
+@decorators.log_action("SELL", verbose=True)
 def sell_currency(currency_code, amount):
     """ Продаёт валюту: списывает баланс, при SETTLE_IN_USD начисляет USD.
 
-    Возвращает данные для отчёта: курс, изменения балансов, оценочную выручку.
+    Снятие средств контролирует сам кошелёк: при нехватке денег возникает
+    InsufficientFundsError, и портфель не сохраняется.
     """
     user = current_user()
-    code = utils.validate_currency_code(currency_code)
+    code = validate_tradable_code(currency_code)
     value = utils.validate_amount(amount)
 
     portfolio = load_portfolio(user.user_id, user=user)
@@ -278,8 +327,20 @@ def sell_currency(currency_code, amount):
         changes.append(apply(usd, lambda: usd.deposit(value * price)))
 
     save_portfolio(portfolio)
+    return trade_result("sell", user.username, code, value, price, changes)
+
+
+def validate_tradable_code(currency_code):
+    """ Нормализует код валюты и проверяет, что она есть в реестре."""
+    code = utils.validate_currency_code(currency_code)
+    return currencies.get_currency(code).code
+
+
+def trade_result(operation, username, code, value, price, changes):
+    """ Собирает единый результат сделки для CLI и лога."""
     return {
-        "operation": "sell",
+        "operation": operation,
+        "username": username,
         "currency_code": code,
         "amount": value,
         "rate": price,

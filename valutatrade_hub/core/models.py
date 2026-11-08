@@ -1,117 +1,24 @@
-"""Классы предметной области и доменные исключения платформы.
+"""Классы предметной области платформы: User, Wallet, Portfolio.
 
-Иерархия исключений намеренно наследуется от ValueError: тексты ошибок уже
-готовы к показу пользователю, поэтому CLI перехватывает их одним блоком
-try...except и не дублирует сообщения.
+Доменные исключения вынесены в core/exceptions.py: их выбирает по смыслу
+бизнес-логика, а CLI печатает как есть. Иерархия ошибок - потомки ValueError,
+поэтому один блок try...except в interface.py покрывает все проверки.
+
+Модели ничего не знают о файлах и сессии: хранилище и курсовой кеш
+подключаются слоем core/usecases.py через infra (DatabaseManager).
 """
 
 from datetime import datetime
 
-from valutatrade_hub.core import utils
-
-
-class ValutaTradeError(ValueError):
-    """ Базовое доменное исключение приложения с текстом для пользователя."""
-
-
-class ValidationError(ValutaTradeError):
-    """ Некорректные вводимые данные (тип, формат, диапазон)."""
-
-
-class DuplicateUsernameError(ValutaTradeError):
-    """ Имя пользователя уже занято."""
-
-    def __init__(self, username):
-        super().__init__(f"Имя пользователя '{username}' уже занято")
-        self.username = username
-
-
-class UserNotFoundError(ValutaTradeError):
-    """ Пользователя с таким именем нет в системе."""
-
-    def __init__(self, username):
-        super().__init__(f"Пользователь '{username}' не найден")
-        self.username = username
-
-
-class WrongPasswordError(ValutaTradeError):
-    """ Пароль не совпадает с сохранённым хешем."""
-
-    def __init__(self):
-        super().__init__("Неверный пароль")
-
-
-class NoSessionError(ValutaTradeError):
-    """ Команда требует залогиненного пользователя."""
-
-    def __init__(self):
-        super().__init__("Сначала выполните login")
-
-
-class WalletExistsError(ValutaTradeError):
-    """ Кошелёк с таким кодом валюты уже есть в портфеле."""
-
-    def __init__(self, currency_code):
-        super().__init__(f"Кошелёк '{currency_code}' уже существует")
-        self.currency_code = currency_code
-
-
-class WalletNotFoundError(ValutaTradeError):
-    """ В портфеле нет кошелька указанной валюты."""
-
-    def __init__(self, currency_code):
-        super().__init__(
-            f"У вас нет кошелька '{currency_code}'. Добавьте валюту: "
-            "она создаётся автоматически при первой покупке."
-        )
-        self.currency_code = currency_code
-
-
-class InsufficientFundsError(ValutaTradeError):
-    """ На кошельке меньше средств, чем требуется для операции."""
-
-    def __init__(self, currency_code, available, required):
-        super().__init__(
-            "Недостаточно средств: доступно "
-            f"{utils.format_amount(available, currency_code)} {currency_code}, "
-            f"требуется {utils.format_amount(required, currency_code)}"
-            f" {currency_code}"
-        )
-        self.currency_code = currency_code
-        self.available = available
-        self.required = required
-
-
-class UnknownCurrencyError(ValutaTradeError):
-    """ Валюту нельзя ни найти в курсах, ни использовать как базовую."""
-
-    def __init__(self, currency_code):
-        super().__init__(f"Неизвестная базовая валюта '{currency_code}'")
-        self.currency_code = currency_code
-
-
-class RateLookupError(ValutaTradeError):
-    """ Не удалось получить курс для расчёта сделки."""
-
-    def __init__(self, currency_from, currency_to):
-        super().__init__(
-            f"Не удалось получить курс для {currency_from}"
-            f"→{currency_to}"
-        )
-        self.currency_from = currency_from
-        self.currency_to = currency_to
-
-
-class RateServiceError(ValutaTradeError):
-    """ Курс недоступен пользователю: нет данных и нет источника обновления."""
-
-    def __init__(self, currency_from, currency_to):
-        super().__init__(
-            f"Курс {currency_from}→{currency_to} недоступен. "
-            "Повторите попытку позже."
-        )
-        self.currency_from = currency_from
-        self.currency_to = currency_to
+from valutatrade_hub.core import currencies, utils
+from valutatrade_hub.core.exceptions import (
+    InsufficientFundsError,
+    RateLookupError,
+    UnknownCurrencyError,
+    ValidationError,
+    WalletExistsError,
+    WalletNotFoundError,
+)
 
 
 def _validate_identifier(value, name):
@@ -252,17 +159,33 @@ class User:
 class Wallet:
     """ Кошелёк пользователя в одной конкретной валюте
         Атрибуты:
-        currency_code: str - код валюты (например, "USD", "BTC").
+        _currency_code: str - код валюты (например, "USD", "BTC").
         _balance: float - баланс в данной валюте (по умолчанию 0.0).
+        _currency: Currency - защищённые справочные данные о валюте из
+        реестра core/currencies.py; читается лениво через свойство currency.
         Методы класса:
         deposit(amount: float) - пополнение баланса.
         withdraw(amount: float) - снятие средств (если баланс позволяет).
         get_balance_info() - вывод информации о текущем балансе.
+        get_display_info() - описание валюты и баланса для UI и логов.
     """
 
     def __init__(self, _currency_code, _balance=0.0):
         self._currency_code = utils.validate_currency_code(_currency_code)
+        self._currency = None
         self.balance = _balance
+
+    @property
+    def currency(self):
+        """ Объект валюты из реестра либо None, если код в него не входит.
+
+        Точка интеграции модели с иерархией Currency: тип, имя и специфика
+        (страна эмиссии у фиата, алгоритм и капитализация у крипты) не хранятся
+        в кошельке, а берутся из справочника.
+        """
+        if self._currency is None:
+            self._currency = currencies.find_currency(self._currency_code)
+        return self._currency
 
     @property
     def balance(self):
@@ -302,6 +225,13 @@ class Wallet:
             f"{self._currency_code}: "
             f"{utils.format_amount(self._balance, self._currency_code)}"
         )
+
+    def get_display_info(self):
+        """ Описание кошелька: данные валюты из реестра плюс баланс."""
+        currency = self.currency
+        if currency is None:
+            return self.get_balance_info()
+        return f"{currency.get_display_info()} / {self.get_balance_info()}"
 
     def to_dict(self):
         """ Возвращает запись для файла портфеля."""

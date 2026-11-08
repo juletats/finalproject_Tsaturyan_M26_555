@@ -1,8 +1,8 @@
 """Командный интерфейс: единственная точка входа для пользовательских команд.
 
-Модуль разбирает строку ввода, вызывает бизнес-логику из core/usecases.py и
-печатает результат. Проверок данных и расчётов здесь нет - только разбор
-аргументов и представление результата.
+Модуль настраивает логи, разбирает строку ввода, вызывает бизнес-логику из
+core/usecases.py и печатает результат. Проверок данных и расчётов здесь нет -
+только разбор аргументов, представление результата и подсказки к ошибкам.
 """
 
 import shlex
@@ -10,7 +10,9 @@ import sys
 
 from prettytable import PrettyTable
 
-from valutatrade_hub.core import usecases, utils
+from valutatrade_hub import logging_config
+from valutatrade_hub.core import currencies, usecases, utils
+from valutatrade_hub.core.exceptions import ApiRequestError, CurrencyNotFoundError
 
 DIVIDER = "-" * 33
 
@@ -108,6 +110,11 @@ def welcome():
     print("Зарегистрируйтесь и следите за курсами.")
 
 
+def supported_currencies_text():
+    """ Строка с кодами валют, которые поддерживает реестр."""
+    return ", ".join(currencies.supported_codes())
+
+
 def print_register(result):
     """ Печатает итог регистрации."""
     username = result["username"]
@@ -170,6 +177,10 @@ def render_trade(result):
     )
     estimate = utils.format_money(result["estimate"], base)
     print(f"{label}: {estimate}")
+
+    currency = currencies.find_currency(result["currency_code"])
+    if currency is not None:
+        print(f"Валюта сделки: {currency.get_display_info()}")
 
 
 def render_rate(info):
@@ -268,8 +279,16 @@ def dispatch(command, tokens):
 
     try:
         handler(tokens)
+    except CurrencyNotFoundError as error:
+        # Доменное исключение печатается как есть, к нему добавляется подсказка
+        print(error)
+        print(f"Поддерживаемые валюты: {supported_currencies_text()}. "
+              "Справка: help get-rate")
+    except ApiRequestError as error:
+        print(error)
+        print("Повторите попытку позже или проверьте подключение к сети: "
+              "курсы обновляются сервисом парсинга.")
     except ValueError as error:
-        # Доменные ошибки несут готовый текст для пользователя
         print(error)
     return True
 
@@ -314,12 +333,10 @@ def run():
 
 def main(argv=None):
     """ Точка входа для пользовательских команд """
+    logging_config.setup_logging()
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments:
         dispatch(arguments[0], arguments[1:])
         return
     run()
 
-
-if __name__ == "__main__":
-    main()

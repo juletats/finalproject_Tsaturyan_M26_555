@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Valuta Trade Hub: логи доменных операций и локальная конфигурация
+/logs/
+config.json
