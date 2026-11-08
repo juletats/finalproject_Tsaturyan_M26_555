@@ -1,7 +1,7 @@
 [project]
-name = "currency-wallet"
+name = "valutatrade-hub"
 version = "0.1.0"
-description = "Платформа для отслеживания и симуляции торговыми валютами"
+description = "Платформа для отслеживания и симуляции торговли валютами: пользователи, портфели, сделки и курсы"
 readme = "README.md"
 authors = [
     { name = "Juliet Tsaturyan", email = "juleta-tsaturyan@mail.ru" }
@@ -12,16 +12,20 @@ dependencies = [
 ]
 
 [project.scripts]
-wallet = "currency_wallet.main:main"
+valutatrade = "valutatrade_hub.cli.interface:main"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+module-root = ""
+module-name = "valutatrade_hub"
+
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-exclude = ["venv", ".venv", "dist", "__pycache__"]
+exclude = ["venv", ".venv", "dist", "data", "__pycache__"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

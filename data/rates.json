@@ -1,0 +1,20 @@
+{
+  "EUR_USD": {
+    "rate": 1.0786,
+    "updated_at": "2026-11-08T21:35:21"
+  },
+  "BTC_USD": {
+    "rate": 59337.21,
+    "updated_at": "2026-11-08T21:35:21"
+  },
+  "RUB_USD": {
+    "rate": 0.01016,
+    "updated_at": "2026-11-08T21:35:21"
+  },
+  "ETH_USD": {
+    "rate": 3720.0,
+    "updated_at": "2026-11-08T21:35:21"
+  },
+  "source": "RateServiceStub",
+  "last_refresh": "2026-11-08T21:35:21"
+}
