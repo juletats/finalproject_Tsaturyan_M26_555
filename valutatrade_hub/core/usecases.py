@@ -5,17 +5,17 @@
 (core/currencies.py), доменные исключения (core/exceptions.py) и логирование
 операций декоратором @log_action (decorators.py). Печати и разбора строки ввода
 здесь нет - это слой cli/interface.py.
-"""
 
-from datetime import datetime
+Курсы берутся только из локального кеша rates.json: внешними API занимается
+сервис парсинга (parser_service), а Core сообщает, что данные устарели"""
 
 from valutatrade_hub import decorators
 from valutatrade_hub.core import currencies, utils
 from valutatrade_hub.core.exceptions import (
-    ApiRequestError,
     DuplicateUsernameError,
     NoSessionError,
     RateLookupError,
+    StaleRatesError,
     UnknownCurrencyError,
     UserNotFoundError,
     WrongPasswordError,
@@ -107,8 +107,8 @@ def save_portfolio(portfolio):
         items = records if isinstance(records, list) else []
         for index, record in enumerate(items):
             same_owner = (
-                isinstance(record, dict)
-                and record.get("user_id") == payload["user_id"]
+                    isinstance(record, dict)
+                    and record.get("user_id") == payload["user_id"]
             )
             if same_owner:
                 items[index] = payload
@@ -121,63 +121,54 @@ def save_portfolio(portfolio):
 
 # --- Курсы -------------------------------------------------------------------
 
-def refresh_rates(rates, now=None):
-    """ Обновляет таблицу курсов и сохраняет её в rates.json.
-
-    Пока Parser Service не подключён, курсы берутся из заглушки
-    utils.build_stub_rates. Тело функции - точка подключения сервиса: запрос к
-    API оборачивается в ApiRequestError, если курс не получен, а формат кеша
-    (rates.json) не меняется.
+def seed_stub_rates():
+    """ Наполняет пустой кеш курсов заглушкой (первый запуск без парсера).
     """
-    try:
-        updated = utils.refresh_rates(rates, now)
-    except (TypeError, ValueError, OSError) as error:
-        raise ApiRequestError(str(error)) from error
-    if not any(isinstance(value, dict) for value in updated.values()):
-        raise ApiRequestError("источник курсов вернул пустую таблицу")
-    utils.save_rates(updated)
+    rates = utils.build_stub_rates()
+    utils.save_rates(rates)
     rate_cache.clear()
-    return updated
+    return rates
+
+
+def invalidate_rate_cache():
+    """ Сбрасывает кеш курса на замыкании: после обновления парсером """
+    rate_cache.clear()
 
 
 def fresh_rates():
-    """ Возвращает таблицу курсов, обновляя кеш, если он устарел.
-
-    Политика свежести (rates_ttl_seconds) берётся из конфигурации приложения.
-    """
+    """ Возвращает таблицу курсов из локального кеша"""
     rates = utils.load_rates()
-    if not utils.is_fresh(rates.get("last_refresh")):
-        rates = refresh_rates(rates)
+    if not utils.pairs_of(rates):
+        return seed_stub_rates()
+    if not utils.is_cache_fresh(rates):
+        raise StaleRatesError(
+            utils.to_utc_iso(utils.cache_updated_at(rates)),
+            utils.rates_ttl(),
+        )
     return rates
 
 
 def lookup_rate(currency_from, currency_to):
-    """ Читает курс пары из кеша, при протухании - обновляет курсы.
-        Возвращает словарь {"rate": float, "updated_at": datetime}.
+    """ Читает курс пары из кеша. Возвращает словарь
+        {"rate": float, "updated_at": datetime}.
     """
-    rates = utils.load_rates()
+    rates = fresh_rates()
     found = utils.find_rate(rates, currency_from, currency_to)
-    if found is None or not utils.is_fresh(found[1]):
-        rates = refresh_rates(rates)
-        found = utils.find_rate(rates, currency_from, currency_to)
     if found is None:
-        raise ApiRequestError(
-            f"нет данных для пары {currency_from}→{currency_to}"
-        )
+        raise RateLookupError(currency_from, currency_to)
     rate, updated_at = found
+    pair = utils.pair_key(currency_from, currency_to)
+    if not utils.is_fresh(updated_at):
+        raise StaleRatesError(updated_at, utils.rates_ttl(), pair)
     return {
         "rate": rate,
-        "updated_at": utils.parse_datetime(updated_at) or datetime.now(),
+        "updated_at": utils.parse_datetime(updated_at) or utils.now_utc(),
     }
 
 
 @decorators.log_action("GET_RATE")
 def get_rate(currency_from, currency_to):
     """ Возвращает курс одной валюты к другой и обратный курс.
-
-        Коды проверяются сначала на формат, затем на присутствие в реестре
-        валют (CurrencyNotFoundError). Результат кэшируется на время сессии,
-        поэтому повторный запрос той же пары не читает и не обновляет файл.
     """
     from_code = utils.validate_currency_code(currency_from)
     to_code = utils.validate_currency_code(currency_to)
@@ -249,9 +240,12 @@ def get_portfolio_summary(base_currency=None):
     base = utils.validate_currency_code(
         base_currency or utils.BASE_CURRENCY
     )
+
+    if currencies.find_currency(base) is None:
+        raise UnknownCurrencyError(base)
     rates = fresh_rates()
     if utils.value_in_base(rates, base) is None:
-        raise UnknownCurrencyError(base)
+        raise RateLookupError(base, utils.BASE_CURRENCY)
 
     portfolio = load_portfolio(user.user_id, user=user)
     rows = []

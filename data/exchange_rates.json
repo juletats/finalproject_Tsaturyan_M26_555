@@ -1,0 +1,86 @@
+[
+  {
+    "id": "BTC_USD_2026-11-09T06:14:12Z",
+    "from_currency": "BTC",
+    "to_currency": "USD",
+    "rate": 74546.0,
+    "timestamp": "2026-11-09T06:14:12Z",
+    "source": "CoinGecko",
+    "meta": {
+      "request_ms": 691,
+      "status_code": 200,
+      "etag": "W/\"2f5a96e28a00952d3d185701f5e96153\"",
+      "raw_id": "bitcoin"
+    }
+  },
+  {
+    "id": "ETH_USD_2026-11-09T06:14:12Z",
+    "from_currency": "ETH",
+    "to_currency": "USD",
+    "rate": 2130.74,
+    "timestamp": "2026-11-09T06:14:12Z",
+    "source": "CoinGecko",
+    "meta": {
+      "request_ms": 691,
+      "status_code": 200,
+      "etag": "W/\"2f5a96e28a00952d3d185701f5e96153\"",
+      "raw_id": "ethereum"
+    }
+  },
+  {
+    "id": "SOL_USD_2026-11-09T06:14:12Z",
+    "from_currency": "SOL",
+    "to_currency": "USD",
+    "rate": 86.56,
+    "timestamp": "2026-11-09T06:14:12Z",
+    "source": "CoinGecko",
+    "meta": {
+      "request_ms": 691,
+      "status_code": 200,
+      "etag": "W/\"2f5a96e28a00952d3d185701f5e96153\"",
+      "raw_id": "solana"
+    }
+  },
+  {
+    "id": "BTC_USD_2026-11-09T06:19:37Z",
+    "from_currency": "BTC",
+    "to_currency": "USD",
+    "rate": 74374.0,
+    "timestamp": "2026-11-09T06:19:37Z",
+    "source": "CoinGecko",
+    "meta": {
+      "request_ms": 419,
+      "status_code": 200,
+      "etag": "W/\"0c09d587ee231c362e52b12bcb0294e1\"",
+      "raw_id": "bitcoin"
+    }
+  },
+  {
+    "id": "ETH_USD_2026-11-09T06:19:37Z",
+    "from_currency": "ETH",
+    "to_currency": "USD",
+    "rate": 2122.86,
+    "timestamp": "2026-11-09T06:19:37Z",
+    "source": "CoinGecko",
+    "meta": {
+      "request_ms": 419,
+      "status_code": 200,
+      "etag": "W/\"0c09d587ee231c362e52b12bcb0294e1\"",
+      "raw_id": "ethereum"
+    }
+  },
+  {
+    "id": "SOL_USD_2026-11-09T06:19:37Z",
+    "from_currency": "SOL",
+    "to_currency": "USD",
+    "rate": 86.25,
+    "timestamp": "2026-11-09T06:19:37Z",
+    "source": "CoinGecko",
+    "meta": {
+      "request_ms": 419,
+      "status_code": 200,
+      "etag": "W/\"0c09d587ee231c362e52b12bcb0294e1\"",
+      "raw_id": "solana"
+    }
+  }
+]

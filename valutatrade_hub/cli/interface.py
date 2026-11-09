@@ -7,16 +7,29 @@ core/usecases.py и печатает результат. Проверок дан
 
 import shlex
 import sys
+import time
 
 from prettytable import PrettyTable
 
 from valutatrade_hub import logging_config
 from valutatrade_hub.core import currencies, usecases, utils
-from valutatrade_hub.core.exceptions import ApiRequestError, CurrencyNotFoundError
+from valutatrade_hub.core.exceptions import (
+    ApiRequestError,
+    CurrencyNotFoundError,
+    StaleRatesError,
+)
+from valutatrade_hub.parser_service import (
+    RateScheduler,
+    RatesStorage,
+    build_updater,
+)
 
 DIVIDER = "-" * 33
 
 PROMPT = ">>> "
+
+# Активный планировщик парсера: один на процесс, запускается --interval
+ACTIVE_SCHEDULER = {"scheduler": None}
 
 # Обязательные аргументы каждой команды
 COMMAND_FLAGS = {
@@ -26,6 +39,8 @@ COMMAND_FLAGS = {
     "buy": ("--currency", "--amount"),
     "sell": ("--currency", "--amount"),
     "get-rate": ("--from", "--to"),
+    "update-rates": ("--source", "--interval"),
+    "show-rates": ("--currency", "--top", "--base"),
 }
 
 # Справочная информация: команда, аргументы, описание
@@ -42,6 +57,11 @@ COMMAND_HELP = (
      "продать валюту"),
     ("get-rate", "--from <str> --to <str>",
      "получить курс одной валюты к другой"),
+    ("update-rates", "[--source <str>] [--interval <int>]",
+     "обновить курсы через парсер (coingecko, exchangerate)"),
+    ("show-rates", "[--currency <str>] [--top <int>] [--base <str>]",
+     "показать кеш курсов с фильтрами"),
+    ("stop-parser", "", "остановить фоновое обновление курсов"),
     ("help", "", "показать эту справку"),
     ("exit", "", "выйти из приложения"),
 )
@@ -198,6 +218,91 @@ def render_rate(info):
     )
 
 
+# --- Парсер курсов: вывод -------------------------------------------------------
+
+
+def rates_storage():
+    """ Хранилище парсера: создаётся по запросу, чтобы пути и настройки
+    брались из актуального Singleton SettingsLoader."""
+    return RatesStorage()
+
+
+def render_update(summary):
+    """ Печатает ход и итог обновления курсов (примеры ТЗ 4.4.6)."""
+    print("INFO: Обновление курсов: старт")
+    for source, count in summary["by_source"].items():
+        print(f"INFO: {source}... OK ({count} курса)")
+    for source in summary["skipped"]:
+        print(
+            f"INFO: {source}... пропущен: не задан EXCHANGERATE_API_KEY"
+        )
+    for source, message in summary["errors"]:
+        print(f"ERROR: {source}... ошибка: {message}")
+
+    total = summary["total"]
+    if not total:
+        print(
+            "Обновление не выполнено: курсы не получены. Проверьте сеть и "
+            "ключ API, журнал: make parser-logs"
+        )
+        return
+    print(
+        f"INFO: запись {summary['snapshot_updated']} курсов в "
+        f"{summary['rates_path']}..."
+    )
+    refresh = summary["last_refresh"] or "нет данных"
+    if summary["errors"] or summary["skipped"]:
+        print(
+            "Обновление завершено с замечаниями. "
+            "Подробности: logs/parser.log"
+        )
+    else:
+        print("Обновление успешно.")
+    print(
+        f"Всего получено курсов: {total}, новых в истории: "
+        f"{summary['history_added']}. Последний снимок: {refresh}"
+    )
+
+
+def render_scheduler_status(status):
+    """ Печатает состояние фонового обновления курсов."""
+    print(
+        f"Планировщик запущен: интервал {status['interval_seconds']} с, "
+        f"источник: {status['source'] or 'все'}"
+    )
+    print(
+        "Первое обновление выполнено сразу, дальше - по расписанию. "
+        "Остановка: stop-parser"
+    )
+
+
+def format_moment(value):
+    """ Метка времени записи кеша для таблицы: локальное время или прочерк."""
+    moment = utils.parse_datetime(value)
+    return utils.format_datetime(moment) if moment else "-"
+
+
+def render_rates(rows, last_refresh, stale):
+    """ Печатает таблицу курсов из локального кеша."""
+    print(f"Курсы из локального кеша (обновлено: {format_moment(last_refresh)}):")
+    table = PrettyTable(["Пара", "Курс", "Обновлено", "Источник"])
+    for column in table.field_names:
+        table.align[column] = "l"
+    for row in rows:
+        table.add_row([
+            row["pair"],
+            utils.format_rate_value(row["rate"]),
+            format_moment(row["updated_at"]),
+            row["source"] or "-",
+        ])
+    print(table)
+    if stale:
+        print(
+            f"Внимание: данные старше срока годности "
+            f"{utils.rates_ttl():.0f} с - выполните update-rates."
+        )
+
+
 # --- Команды -----------------------------------------------------------------
 
 
@@ -254,6 +359,166 @@ def handle_get_rate(tokens):
     render_rate(usecases.get_rate(currency_from, currency_to))
 
 
+def validate_positive_int(value, label):
+    """ Целое из строки аргумента команды: только положительное."""
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} должен быть целым числом") from None
+    if number <= 0:
+        raise ValueError(f"{label} должен быть положительным числом")
+    return number
+
+
+def stop_scheduler():
+    """ Останавливает активный планировщик. Возвращает число проходов."""
+    scheduler = ACTIVE_SCHEDULER["scheduler"]
+    if scheduler is None:
+        return None
+    ACTIVE_SCHEDULER["scheduler"] = None
+    return scheduler.stop()
+
+
+def handle_update_rates(tokens):
+    """ Команда update-rates: немедленное обновление курсов парсером.
+
+    С --interval обновление уходит в фоновый поток и повторяется по
+    расписанию, REPL при этом остаётся отзывчивым.
+    """
+    flags = parse_flags("update-rates", tokens, COMMAND_FLAGS["update-rates"])
+    source = flags.get("--source")
+    updater = build_updater()
+    interval = flags.get("--interval")
+    if interval is None:
+        render_update(updater.run_update(source))
+        usecases.invalidate_rate_cache()
+        return
+
+    seconds = validate_positive_int(interval, "--interval")
+    if stop_scheduler() is not None:
+        print("Прежний планировщик остановлен.")
+    scheduler = RateScheduler(updater=updater, interval_seconds=seconds)
+    scheduler.start(source)
+    ACTIVE_SCHEDULER["scheduler"] = scheduler
+    render_scheduler_status(scheduler.status())
+
+
+def handle_stop_parser(tokens):
+    """ Команда stop-parser: гасит фоновое обновление курсов."""
+    if tokens:
+        raise ValueError("Команда 'stop-parser' не принимает аргументов")
+    runs = stop_scheduler()
+    if runs is None:
+        print("Фоновое обновление курсов не запущено.")
+        return
+    print(f"Фоновое обновление остановлено, выполнено проходов: {runs}.")
+
+
+def rate_entries(table=None):
+    """ Записи пар из кеша курсов: код пары, курс, время, источник."""
+    snapshot = table if table is not None else rates_storage().read_snapshot()
+    rows = []
+    for key, entry in sorted(utils.pairs_of(snapshot).items()):
+        found = utils.entry_rate(entry)
+        if found is None:
+            continue
+        rate, updated_at = found
+        rows.append({
+            "pair": key,
+            "rate": rate,
+            "updated_at": updated_at,
+            "source": entry.get("source") if isinstance(entry, dict) else None,
+        })
+    return rows
+
+
+def filter_currency(rows, code):
+    """ Строки только по одной валюте (с любой стороны пары).
+
+    Пустой результат сопровождается текстом из ТЗ 4.4.6: «Курс для 'ABC' не
+    найден в кеше» - подсказка ближе к фильтру, чем общий текст об отсутствии
+    строк.
+    """
+    wanted = utils.validate_currency_code(code)
+    found = [
+        row for row in rows
+        if wanted in str(row["pair"]).split("_")
+    ]
+    if not found:
+        print(f"Курс для '{wanted}' не найден в кеше.")
+    return found
+
+
+def rebase_rows(rows, base):
+    """ Пересчитывает курсы относительно другой базовой валюты."""
+    code = currencies.get_currency(
+        utils.validate_currency_code(base)
+    ).code
+    table = rates_storage().read_snapshot()
+    result = []
+    for row in rows:
+        currency_from, _, _ = str(row["pair"]).partition("_")
+        if currency_from == code:
+            result.append(row)
+            continue
+        found = utils.find_rate(table, currency_from, code)
+        if found is None:
+            continue
+        rate, updated_at = found
+        result.append({
+            "pair": utils.pair_key(currency_from, code),
+            "rate": rate,
+            "updated_at": updated_at,
+            "source": row["source"],
+        })
+    return result
+
+
+def top_cryptos(rows, count):
+    """ N самых дорогих криптовалют по курсу."""
+    crypto = [
+        row for row in rows
+        if str(row["pair"]).partition("_")[0] in utils.CRYPTO_CURRENCIES
+    ]
+    crypto.sort(key=lambda row: row["rate"], reverse=True)
+    return crypto[:count]
+
+
+def handle_show_rates(tokens):
+    """ Команда show-rates: курсы из локального кеша с фильтрами."""
+    flags = parse_flags("show-rates", tokens, COMMAND_FLAGS["show-rates"])
+    storage = rates_storage()
+    table = storage.read_snapshot()
+    rows = rate_entries(table)
+    if not rows:
+        print(
+            "Локальный кеш курсов пуст. Выполните 'update-rates', чтобы "
+            "загрузить данные."
+        )
+        return
+
+    currency = flags.get("--currency")
+    if currency is not None:
+        rows = filter_currency(rows, currency)
+        # Текст «не найдено» уже напечатан фильтром
+        if not rows:
+            return
+    base = flags.get("--base")
+    if base is not None:
+        rows = rebase_rows(rows, base)
+    top = flags.get("--top")
+    if top is not None:
+        rows = top_cryptos(rows, validate_positive_int(top, "--top"))
+    if not rows:
+        print("Под выбранные фильтры курсов в кеше нет.")
+        return
+    render_rates(
+        rows,
+        table.get("last_refresh"),
+        not utils.is_cache_fresh(table),
+    )
+
+
 COMMAND_HANDLERS = {
     "register": register,
     "login": handle_login,
@@ -261,6 +526,9 @@ COMMAND_HANDLERS = {
     "buy": handle_buy,
     "sell": handle_sell,
     "get-rate": handle_get_rate,
+    "update-rates": handle_update_rates,
+    "show-rates": handle_show_rates,
+    "stop-parser": handle_stop_parser,
 }
 
 
@@ -288,6 +556,10 @@ def dispatch(command, tokens):
         print(error)
         print("Повторите попытку позже или проверьте подключение к сети: "
               "курсы обновляются сервисом парсинга.")
+    except StaleRatesError as error:
+        print(error)
+        print(f"Срок годности кеша задаёт настройка rates_ttl_seconds "
+              f"(сейчас {utils.rates_ttl():.0f} с).")
     except ValueError as error:
         print(error)
     return True
@@ -328,7 +600,27 @@ def run():
         if not execute_line(line):
             break
 
+    runs = stop_scheduler()
+    if runs is not None:
+        print(f"Фоновое обновление курсов остановлено, проходов: {runs}.")
     print("До встречи!")
+
+
+def wait_for_scheduler():
+    """ Держит процесс, пока работает фоновое обновление.
+
+    Нужен для однократного запуска (python main.py update-rates --interval 60):
+    планировщик - демон-поток, и без ожидания процесс завершился бы сразу.
+    """
+    if ACTIVE_SCHEDULER["scheduler"] is None:
+        return
+    print("Фоновое обновление курсов работает. Остановка: Ctrl+C.")
+    try:
+        while ACTIVE_SCHEDULER["scheduler"].running:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print()
+    stop_scheduler()
 
 
 def main(argv=None):
@@ -337,6 +629,7 @@ def main(argv=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments:
         dispatch(arguments[0], arguments[1:])
+        wait_for_scheduler()
         return
     run()
 

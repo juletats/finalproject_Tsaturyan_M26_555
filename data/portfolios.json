@@ -10,8 +10,19 @@
   {
     "user_id": 2,
     "wallets": {
+      "EUR": {
+        "balance": 990.0
+      },
       "RUB": {
         "balance": 2345.0
+      }
+    }
+  },
+  {
+    "user_id": 3,
+    "wallets": {
+      "EUR": {
+        "balance": 10.0
       }
     }
   }

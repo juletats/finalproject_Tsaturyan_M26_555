@@ -117,12 +117,13 @@ class CryptoCurrency(Currency):
         )
 
 
-
 FIAT_CURRENCIES = (
     FiatCurrency(
         name="US Dollar", code="USD", issuing_country="United States"
     ),
     FiatCurrency(name="Euro", code="EUR", issuing_country="Eurozone"),
+    FiatCurrency(name="Pound Sterling", code="GBP",
+                 issuing_country="United Kingdom"),
     FiatCurrency(name="Russian Ruble", code="RUB", issuing_country="Russia"),
     FiatCurrency(name="Turkish Lira", code="TRY", issuing_country="Turkey"),
 )
@@ -134,6 +135,8 @@ CRYPTO_CURRENCIES = (
     CryptoCurrency(
         name="Ethereum", code="ETH", algorithm="Ethash", market_cap=2.14e11
     ),
+    CryptoCurrency(name="Solana", code="SOL",
+                   algorithm="Proof of Stake", market_cap=6.60e10),
 )
 
 CURRENCY_REGISTRY = {

@@ -17,22 +17,30 @@ TOOL_SECTION = ("tool", "valutatrade")
 # Переменные окружения: дом приложения (в нём data/ и logs/) и уровень логов
 ENV_HOME = "VALUTATRADE_HOME"
 ENV_LOG_LEVEL = "VALUTATRADE_LOG_LEVEL"
+ENV_PARSER_INTERVAL = "VALUTATRADE_PARSER_INTERVAL"
+# Ключ ExchangeRate-API читается только из окружения (parser_service/config.py)
+ENV_EXCHANGERATE_KEY = "EXCHANGERATE_API_KEY"
 
-# Минимальный набор ключей: пути к JSON, TTL курсов, параметры логов
+# Минимальный набор ключей: пути к JSON, TTL курсов, параметры логов и парсера
 DEFAULT_SETTINGS = {
     "data_dir": os.path.join(os.getcwd(), "data"),
     "users_file": "users.json",
     "portfolios_file": "portfolios.json",
     "rates_file": "rates.json",
+    "exchange_rates_file": "exchange_rates.json",
     "rates_ttl_seconds": 300,
     "base_currency": "USD",
     "min_password_length": 4,
     "log_dir": os.path.join(os.getcwd(), "logs"),
     "log_file": "actions.log",
+    "parser_log_file": "parser.log",
     "log_level": "INFO",
     "log_format": "text",
     "log_max_bytes": 1000000,
     "log_backup_count": 3,
+    "parser_request_timeout": 10,
+    "parser_update_interval_seconds": 900,
+    "parser_history_limit": 5000,
 }
 
 # Ключи, значения которых трактуются как пути: приводятся к абсолютному виду
@@ -110,6 +118,9 @@ class SettingsLoader(metaclass=Singleton):
         log_level = os.environ.get(ENV_LOG_LEVEL)
         if log_level:
             values["log_level"] = log_level
+        interval = os.environ.get(ENV_PARSER_INTERVAL)
+        if interval:
+            values["parser_update_interval_seconds"] = interval
         return values
 
     def __repr__(self):

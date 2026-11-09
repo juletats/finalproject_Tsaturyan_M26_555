@@ -11,6 +11,7 @@ COLLECTIONS = {
     "users": "users_file",
     "portfolios": "portfolios_file",
     "rates": "rates_file",
+    "exchange_rates": "exchange_rates_file",
 }
 
 # Временный файл при записи переименовывается на месте
@@ -24,7 +25,8 @@ class DatabaseManager(metaclass=Singleton):
         self._settings = SettingsLoader()
 
     def path(self, collection):
-        """ Полный путь файла коллекции ('users', 'portfolios', 'rates')."""
+        """ Полный путь файла коллекции ('users', 'portfolios', 'rates',
+        'exchange_rates')."""
         try:
             filename = self._settings.get(COLLECTIONS[collection])
         except KeyError as error:

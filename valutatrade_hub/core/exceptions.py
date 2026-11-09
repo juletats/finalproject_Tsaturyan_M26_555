@@ -84,6 +84,21 @@ class RateLookupError(ValutaTradeError):
         )
 
 
+class StaleRatesError(ValutaTradeError):
+
+    def __init__(self, updated_at=None, ttl_seconds=None, currency_pair=None):
+        self.updated_at = updated_at
+        self.ttl_seconds = ttl_seconds
+        self.currency_pair = currency_pair
+        where = f" для пары {currency_pair}" if currency_pair else ""
+        moment = utils.parse_datetime(updated_at)
+        label = utils.format_datetime(moment) if moment else "нет"
+        text = f"Курсы устарели{where}: обновлено {label}"
+        if ttl_seconds:
+            text += f", срок годности {int(float(ttl_seconds))} с"
+        super().__init__(f"{text}. Выполните update-rates.")
+
+
 class ApiRequestError(ValutaTradeError):
     """ Сбой внешнего сервиса курсов"""
     def __init__(self, reason):

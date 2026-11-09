@@ -9,7 +9,7 @@ SettingsLoader, а ввод-вывод JSON - из Singleton DatabaseManager: ф
 import hashlib
 import re
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 
 from valutatrade_hub.infra.database import DatabaseManager
 from valutatrade_hub.infra.settings import SettingsLoader
@@ -26,19 +26,22 @@ CURRENCY_PATTERN = re.compile(r"^[A-Z0-9]{2,5}$")
 # Балансы крипто-валют показываются с четырьмя знаками, фиатные - с двумя.
 # Типы валют как объекты описаны в core/currencies.py, здесь только правило
 # вывода чисел
-CRYPTO_CURRENCIES = frozenset({"BTC", "ETH"})
+CRYPTO_CURRENCIES = frozenset({"BTC", "ETH", "SOL"})
 # Сколько секунд запись в rates.json считается актуальной (значение по
 # умолчанию; реально TTL читается из конфигурации в момент проверки)
 RATES_TTL_SECONDS = 5 * 60
-# Источник курсов, пока Parser Service не подключён
+# Источник курсов, пока Parser Service не наполнял кеш
 STUB_SOURCE = "RateServiceStub"
 
 # Курсы-заглушка: 1 единица валюты = N базовых валют (USD)
 DEFAULT_EXCHANGE_RATES = {
     "EUR": 1.0786,
+    "GBP": 1.2635,
     "RUB": 0.01016,
+    "TRY": 0.0238,
     "BTC": 59337.21,
     "ETH": 3720.00,
+    "SOL": 145.12,
 }
 
 
@@ -154,7 +157,9 @@ def format_rate_value(value):
 
 
 def format_datetime(moment):
-    """ Форматирует дату и время для вывода """
+    """ Форматирует дату и время для вывода: метка UTC показывается местно."""
+    if moment is not None and moment.tzinfo is not None:
+        moment = moment.astimezone()
     return moment.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -166,6 +171,34 @@ def parse_datetime(value):
         return datetime.fromisoformat(str(value))
     except ValueError:
         return None
+
+
+def now_utc():
+    """ Текущее время в UTC с часовой меткой - единая шкала для сравнений."""
+    return datetime.now(timezone.utc)
+
+
+def utc_timestamp():
+    """ Метка времени ISO в UTC с суффиксом Z: формат записей парсера."""
+    text = now_utc().isoformat(timespec="seconds")
+    return text.replace("+00:00", "Z")
+
+
+def to_aware(moment):
+    """ Приводит datetime к aware-UTC. Наивные метки считаются локальными"""
+    if moment is None or moment.tzinfo is not None:
+        return moment
+    return moment.astimezone()
+
+
+def to_utc_iso(moment):
+    """ Метка ISO в UTC с суффиксом Z из datetime (None - если момента нет)."""
+    moment = to_aware(moment)
+    if moment is None:
+        return None
+    return moment.astimezone(timezone.utc).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
 
 
 def pair_key(currency_from, currency_to):
@@ -223,20 +256,85 @@ def find_rate(rates, currency_from, currency_to):
 
 def is_fresh(updated_at, now=None, ttl_seconds=None):
     """ True, если метка времени обновления не старше TTL из конфигурации."""
-    moment = parse_datetime(updated_at)
+    moment = to_aware(parse_datetime(updated_at))
     if moment is None:
         return False
-    reference = now or datetime.now()
+    reference = to_aware(now) if now is not None else now_utc()
+    lifetime = rates_ttl() if ttl_seconds is None else float(ttl_seconds)
+    return (reference - moment).total_seconds() <= lifetime
+
+
+# --- Формат кеша курсов -----------------------------------------------------
+# Parser Service пишет вложенный формат
+# {"pairs": {...}, "last_refresh": ...} (ТЗ 4.4),
+# бизнес-логика работает с плоским словарём, поэтому конвертация
+# живёт в одном месте: на чтении и на записи.
+RATES_PAIRS_KEY = "pairs"
+
+
+def pairs_of(rates):
+    """ Словарь пар из кеша любого формата: вложенного или плоского."""
+    if not isinstance(rates, dict):
+        return {}
+    nested = rates.get(RATES_PAIRS_KEY)
+    if isinstance(nested, dict):
+        return dict(nested)
+    return {
+        key: value for key, value in rates.items() if isinstance(value, dict)
+    }
+
+
+def normalize_rates(rates):
+    """ Плоское представление кеша: пары на верхнем уровне + время снимка."""
+    table = pairs_of(rates)
+    if not isinstance(rates, dict):
+        return table
+    for key in ("source", "last_refresh"):
+        if key in rates:
+            table[key] = rates[key]
+    return table
+
+
+def wrap_rates(rates):
+    """ Собирает содержимое rates.json из плоской таблицы курсов."""
+    source = STUB_SOURCE
+    if isinstance(rates, dict):
+        source = rates.get("source", STUB_SOURCE)
+    pairs = {}
+    for key, entry in pairs_of(rates).items():
+        record = dict(entry)
+        record.setdefault("source", source)
+        pairs[key] = record
+    last_refresh = (rates or {}).get("last_refresh") or utc_timestamp()
+    return {RATES_PAIRS_KEY: pairs, "last_refresh": last_refresh}
+
+
+def cache_updated_at(rates):
+    """ Самая свежая метка обновления среди записей пар (datetime или None)."""
+    stamps = [
+        to_aware(parse_datetime(entry.get("updated_at")))
+        for entry in pairs_of(rates).values() if isinstance(entry, dict)
+    ]
+    stamps = [stamp for stamp in stamps if stamp is not None]
+    return max(stamps) if stamps else None
+
+
+def is_cache_fresh(rates, now=None, ttl_seconds=None):
+    """ True, если кеш содержит хотя бы одну свежую по TTL запись."""
+    moment = cache_updated_at(rates)
+    if moment is None:
+        return False
+    reference = to_aware(now) if now is not None else now_utc()
     lifetime = rates_ttl() if ttl_seconds is None else float(ttl_seconds)
     return (reference - moment).total_seconds() <= lifetime
 
 
 def build_stub_rates(now=None):
     """ Собирает таблицу курсов в формате rates.json из данных-заглушки.
-        Заглушка эмулирует ответ Parser Service и подключается до того этапа,
-        когда сервис будет реализован: достаточно заменить тело refresh_rates().
+        Заглушка наполняет только пустой кеш при первом запуске: живые курсы
+        пишет парсер (parser_service), Core к внешним API не обращается.
     """
-    timestamp = (now or datetime.now()).isoformat(timespec="seconds")
+    timestamp = to_utc_iso(now) if now else utc_timestamp()
     rates = {
         pair_key(code, BASE_CURRENCY): {
             "rate": rate,
@@ -249,31 +347,15 @@ def build_stub_rates(now=None):
     return rates
 
 
-def refresh_rates(rates, now=None):
-    """ Обновляет кеш курсов: объединяет имеющиеся данные с актуальными.
-        Возвращает новую таблицу в формате rates.json.
-    """
-    fresh = build_stub_rates(now)
-    merged = {
-        key: value
-        for key, value in rates.items()
-        if isinstance(value, dict)
-    }
-    merged.update(fresh)
-    merged["source"] = fresh["source"]
-    merged["last_refresh"] = fresh["last_refresh"]
-    return merged
-
-
 def load_rates():
-    """ Читает кеш курсов из rates.json (пустой словарь, если файла нет)."""
+    """ Читает кеш курсов из rates.json (плоский вид, пустой словарь без файла)."""
     rates = DATABASE.read("rates", default={})
-    return rates if isinstance(rates, dict) else {}
+    return normalize_rates(rates) if isinstance(rates, dict) else {}
 
 
 def save_rates(rates):
-    """ Сохраняет кеш курсов в rates.json атомарной записью."""
-    DATABASE.write("rates", rates)
+    """ Сохраняет кеш курсов в rates.json атомарной записью (формат 'pairs')."""
+    DATABASE.write("rates", wrap_rates(rates))
 
 
 def rates_or_stub(rates=None):
@@ -281,10 +363,10 @@ def rates_or_stub(rates=None):
         Пустой или повреждённый rates.json (например, при первом запуске без
         каталога данных) не должен ломать расчёт стоимости - в этом случае
         используются фиктивные курсы DEFAULT_EXCHANGE_RATES. Файл при этом не
-        меняется: обновление кеша остаётся ответственностью бизнес-логики.
+        меняется: наполнение кеша - задача Parser Service.
     """
-    table = rates if rates is not None else load_rates()
-    if any(isinstance(entry, dict) for entry in table.values()):
+    table = normalize_rates(rates) if rates is not None else load_rates()
+    if pairs_of(table):
         return table
     return build_stub_rates()
 

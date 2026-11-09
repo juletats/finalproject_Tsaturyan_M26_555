@@ -1,4 +1,4 @@
-.PHONY: install lint format run once logs build clean
+.PHONY: install lint format run once logs parser-logs build clean
 
 ## Установка зависимостей и создание окружения
 install:
@@ -26,6 +26,14 @@ logs:
 		tail -n $(or $(LOG_LINES),20) logs/actions.log; \
 	else \
 		echo "Журнал ещё не создан: logs/actions.log - выполните пару команд приложения"; \
+	fi
+
+## Последние строки журнала парсера: make parser-logs LOG_LINES=50
+parser-logs:
+	@if [ -f logs/parser.log ]; then \
+		tail -n $(or $(LOG_LINES),20) logs/parser.log; \
+	else \
+		echo "Журнал парсера ещё не создан: logs/parser.log - выполните update-rates"; \
 	fi
 
 ## Сборка пакета
